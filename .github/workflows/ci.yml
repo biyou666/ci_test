@@ -1,0 +1,294 @@
+name: TestCI
+
+on: # yamllint disable-line rule:truthy
+  pull_request:
+    types:
+      - synchronize
+      - reopened
+      - opened
+      - ready_for_review
+      - labeled
+    branches:
+      - develop
+      - '[0-9]+\.[0-9]+' # This will match version branches like 2.5, 3.0, etc.
+    paths-ignore:
+      - '**.md'
+      - 'docker/docs/**'
+      - 'docs/**'
+      - 'spec/**'
+      - 'utils/check-style/aspell-ignore/**'
+      - 'examples/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_address_x64:
+    uses: ../.github/workflows/run_command.yml@develop
+    if: ${{ github.event.pull_request.draft == false && !startsWith(github.head_ref, 'porting/') }}
+    with:
+      ec2-instance-type: ${{ vars.X64_INSTANCE_TYPE }}
+      ec2-image-id: ${{ vars.X64_AMI }}
+      ec2-volume-size: ${{ vars.VOLUME_SIZE }}
+      submodules: 'recursive'
+      run_mode: 'start' # start ec2 on demand instance
+      sanitizer: "address"
+      arch: ${{ vars.X64_ARCH }}
+      upjob: build_address_x64
+      command: |
+        cd $GITHUB_WORKSPACE
+
+        # git config
+        git config user.name "proton-robot"
+        git config user.email "proton_robot@timeplus.io"
+        
+        # prepare build cache
+        aws s3 cp --no-progress s3://tp-internal/proton/ci_cache_enterprise/cache${SANITIZER:+_}$SANITIZER${ARCH:+_}$ARCH.tar.gz .
+        mkdir $GITHUB_WORKSPACE/ccache
+        tar -zxf ./cache${SANITIZER:+_}$SANITIZER${ARCH:+_}$ARCH.tar.gz -C $GITHUB_WORKSPACE/ccache
+        rm cache${SANITIZER:+_}$SANITIZER${ARCH:+_}$ARCH.tar.gz
+
+        # compiling
+        ./docker/packager/packager --package-type binary --docker-image-version clang-18 --sanitizer $SANITIZER --proton-build --enable-proton-local --cache ccache --ccache_dir $GITHUB_WORKSPACE/ccache --output-dir $GITHUB_WORKSPACE/output
+
+        # clear compiling footprint
+        rm -rf $GITHUB_WORKSPACE/ccache
+        rm -rf build_docker
+
+        # build unit test docker image
+        cp $GITHUB_WORKSPACE/output/unit_tests_dbms $GITHUB_WORKSPACE/docker/test/proton_unit_test/
+        cd $GITHUB_WORKSPACE/docker/test/proton_unit_test/
+        docker build . -t timeplus/proton-unit-test:testing-$SANITIZER-$ARCH-$GITHUB_SHA
+        docker push timeplus/proton-unit-test:testing-$SANITIZER-$ARCH-$GITHUB_SHA
+
+        docker run --name static-server -p 8080:80 -v $GITHUB_WORKSPACE/output:/usr/share/nginx/html:ro -d nginx
+        cd $GITHUB_WORKSPACE/docker/server
+
+        # prepare files to be copied to the image
+        mkdir -p resources/protos/google/protobuf
+        cp -r $GITHUB_WORKSPACE/contrib/google-protobuf/src/google/protobuf/*.proto ./resources/protos/google/protobuf/
+        rm -rf resources/protos/google/protobuf/unittest_*
+
+        # build docker image
+        docker build . --network host --build-arg single_binary_location_url=http://localhost:8080/timeplusd -t timeplus/timeplusd_testing:testing-$SANITIZER-$ARCH-$GITHUB_SHA
+
+        # push docker image
+        docker push timeplus/timeplusd_testing:testing-$SANITIZER-$ARCH-$GITHUB_SHA
+
+        echo 'docker pull timeplus/timeplusd_testing:testing-$SANITIZER-$ARCH-$GITHUB_SHA'
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      TIMEPLUS_ADDRESS: ${{ secrets.TIMEPLUS_ADDRESS }}
+      TIMEPLUS_API_KEY: ${{ secrets.TIMEPLUS_API_KEY }}
+      TIMEPLUS_WORKSPACE: ${{ secrets.TIMEPLUS_WORKSPACE }}
+  unit_test_address_x64:
+    needs: build_address_x64
+    uses: ../.github/workflows/run_command.yml@develop
+    if: github.event.pull_request.draft == false
+    with:
+      ec2-instance-type: c5.2xlarge
+      ec2-image-id: ${{ vars.X64_TEST_AMI }}
+      ec2-volume-size: '40'
+      submodules: false
+      sanitizer: "address"
+      arch: ${{ vars.X64_ARCH }}
+      timeout: 40
+      upjob: unit_test_address_x64
+      command: |
+        cd $GITHUB_WORKSPACE/tests/proton_ci
+        export PROTON_VERSION=testing-$SANITIZER-$ARCH-$GITHUB_SHA
+
+        # make virtualenv
+        ln -s /usr/bin/python3 /usr/bin/python
+        apt-get update
+        systemctl stop unattended-upgrades
+        apt install python3-venv jq -y
+        python -m venv env
+        source env/bin/activate
+
+        pip install -r requirements.txt
+        python unit_tests_check.py
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      TIMEPLUS_ADDRESS: ${{ secrets.TIMEPLUS_ADDRESS }}
+      TIMEPLUS_API_KEY: ${{ secrets.TIMEPLUS_API_KEY }}
+      TIMEPLUS_WORKSPACE: ${{ secrets.TIMEPLUS_WORKSPACE }}
+  smoke_test_address_x64:
+    needs: build_address_x64
+    uses: ../.github/workflows/run_command.yml@develop
+    if: github.event.pull_request.draft == false
+    with:
+      ec2-instance-type: c7i.8xlarge
+      ec2-image-id: ${{ vars.X64_TEST_AMI }}
+      ec2-volume-size: '60'
+      submodules: false
+      sanitizer: "address"
+      arch: ${{ vars.X64_ARCH }}
+      timeout: 80 # cover python-udf test
+      upjob: smoke_test_address_x64
+      command: |
+        # run smoke test
+        export PROTON_VERSION=testing-$SANITIZER-$ARCH-$GITHUB_SHA
+        export PROTON_REPO=timeplus/timeplusd_testing
+
+        cd $GITHUB_WORKSPACE/docker/test/smoke/
+        docker build . -f Dockerfile --build-arg FROM_TAG=$PROTON_VERSION --build-arg FROM_REPO=$PROTON_REPO -t timeplus/proton-smoke-test:$PROTON_VERSION
+        docker pull timeplus/redpanda-smoke-test:v24.2.12
+        docker pull timeplus/probe:0.1.9
+        docker pull apachepulsar/pulsar:3.3.1
+
+        cd $GITHUB_WORKSPACE/tests/cluster/
+        sudo curl -L "https://github.com/docker/compose/releases/download/v2.5.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
+
+        LABELS="${{ join(github.event.pull_request.labels.*.name, ' ') }}"
+        echo "PR Labels: $LABELS"
+        if echo "$LABELS" | grep -q "python-udf"; then
+          bash run.sh python-udf-library
+        else
+          bash run.sh
+        fi
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      TIMEPLUS_ADDRESS: ${{ secrets.TIMEPLUS_ADDRESS }}
+      TIMEPLUS_API_KEY: ${{ secrets.TIMEPLUS_API_KEY }}
+      TIMEPLUS_WORKSPACE: ${{ secrets.TIMEPLUS_WORKSPACE }}
+  stateless_test_address_x64:
+    needs: build_address_x64
+    uses: ../.github/workflows/run_command.yml@develop
+    if: github.event.pull_request.draft == false
+    with:
+      ec2-instance-type: c5.4xlarge
+      ec2-image-id: ${{ vars.X64_TEST_AMI }}
+      ec2-volume-size: '50'
+      submodules: false
+      sanitizer: "address"
+      arch: ${{ vars.X64_ARCH }}
+      timeout: 60
+      upjob: stateless_test_address_x64
+      command: |
+        cd $GITHUB_WORKSPACE/tests/proton_ci
+        mkdir $GITHUB_WORKSPACE/output
+
+        # make virtualenv
+        ln -s /usr/bin/python3 /usr/bin/python
+        apt-get update
+        systemctl stop unattended-upgrades
+        apt install python3-venv jq -y
+        python -m venv env
+        source env/bin/activate
+        pip install -r requirements.txt
+
+        export PROTON_VERSION=testing-$SANITIZER-$ARCH-$GITHUB_SHA
+        export PROTON_REPO=timeplus/timeplusd_testing
+        chown -R 101 $GITHUB_WORKSPACE
+        python functional_tests_check.py stateless
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      TIMEPLUS_ADDRESS: ${{ secrets.TIMEPLUS_ADDRESS }}
+      TIMEPLUS_API_KEY: ${{ secrets.TIMEPLUS_API_KEY }}
+      TIMEPLUS_WORKSPACE: ${{ secrets.TIMEPLUS_WORKSPACE }}
+  stateful_test_address_x64:
+    needs: build_address_x64
+    uses: ../.github/workflows/run_command.yml@develop
+    if: github.event.pull_request.draft == false
+    with:
+      ec2-instance-type: c5.2xlarge
+      ec2-image-id: ${{vars.X64_TEST_AMI }}
+      ec2-volume-size: '40'
+      submodules: false
+      sanitizer: "address"
+      arch: ${{ vars.X64_ARCH }}
+      timeout: 40
+      upjob: stateful_test_address_x64
+      command: |
+        cd $GITHUB_WORKSPACE/tests/proton_ci
+        mkdir $GITHUB_WORKSPACE/output
+
+        # make virtualenv
+        ln -s /usr/bin/python3 /usr/bin/python
+        apt-get update
+        systemctl stop unattended-upgrades
+        apt install python3-venv jq -y
+        python -m venv env
+        source env/bin/activate
+        pip install -r requirements.txt
+        export PROTON_VERSION=testing-$SANITIZER-$ARCH-$GITHUB_SHA
+        export PROTON_REPO=timeplus/timeplusd_testing
+        chown -R 101 $GITHUB_WORKSPACE
+        python functional_tests_check.py stateful
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      TIMEPLUS_ADDRESS: ${{ secrets.TIMEPLUS_ADDRESS }}
+      TIMEPLUS_API_KEY: ${{ secrets.TIMEPLUS_API_KEY }}
+      TIMEPLUS_WORKSPACE: ${{ secrets.TIMEPLUS_WORKSPACE }}
+  SkipDraft:
+    if: github.event.pull_request.draft == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    - name: Skip draft
+      run: echo "Skip draft"
+  SkipPortingBranch:
+    if: startsWith(github.head_ref, 'porting/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    - name: Skip porting branch
+      run: echo "Skip porting branch"
+  clean_passed_test_image:
+    needs:
+      - unit_test_address_x64
+      - smoke_test_address_x64
+      - stateless_test_address_x64
+      - stateful_test_address_x64
+    runs-on: ubuntu-latest
+    steps:
+      - name: delete testing image
+        run: |
+          echo "try to delete image with tag testing-$SANITIZER-$ARCH-$GITHUB_SHA"
+
+          curl -L \
+          -X POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer $GH_PERSONAL_ACCESS_TOKEN" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          https://api.github.com/repos/timeplus-io/proton-enterprise/actions/workflows/manual_trigger_delete_image.yml/dispatches \
+          -d "{\"ref\":\"develop\",\"inputs\":{\"tag\":\"testing-$SANITIZER-$ARCH-$GITHUB_SHA\,\"repo\":\"timeplus/timeplusd_testing\"}}"
+        env:
+          GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          SANITIZER: "address"
+          ARCH: ${{ vars.X64_ARCH }}
